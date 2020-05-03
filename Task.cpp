@@ -243,7 +243,7 @@ namespace Transports
             try
             {
               int rv = (*itr)->read(bfr, sizeof(bfr));
-              
+
               if (rv > 0 && !strncmp(bfr , "$PCONTROL," , 10))
               {
                 std::vector<std::string> parts;
@@ -262,7 +262,7 @@ namespace Transports
               {
                 std::vector<std::string> parts;
                 String::split(std::string(bfr), ",", parts);
-                
+
                 if (parts.size() > 4)
                 {
                   IMC::SmsRequest msg;
@@ -334,11 +334,11 @@ namespace Transports
           {
             m_send_channel_state = 0;
           }
-          
+
           if (m_client_data_timer.overflow())
           {
             char data[100];
-            int len = sprintf(data , "+TPH,%2.2f,%2.2f,%2.2f\r\n",m_temperature , m_pressure , m_humidity); 
+            int len = sprintf(data , "+TPH,%2.2f,%2.2f,%2.2f\r\n",m_temperature , m_pressure , m_humidity);
             dispatchToClients(data , len);
             m_send_channel_state = 1;
             m_client_data_timer.reset();
