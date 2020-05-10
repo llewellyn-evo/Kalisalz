@@ -29,6 +29,8 @@
 
 // DUNE headers.
 #include <DUNE/DUNE.hpp>
+#include <DUNE/Utils/LineParser.hpp>
+#include <vector>
 
 namespace Transports
 {
@@ -44,6 +46,14 @@ namespace Transports
       unsigned tcp_port;
       //! timer for TCP client async data
       double tcp_data_timer;
+      //! maxcimum allowed clients
+      unsigned int max_clients;
+    };
+
+    struct channel_info
+    {
+      std::string name;
+      bool state;
     };
 
     struct Task: public DUNE::Tasks::Task
@@ -58,17 +68,17 @@ namespace Transports
       // I/O Multiplexer.
       Poll m_poll;
       // Clients.
-      std::list<TCPSocket*> m_clients;
+      std::list<std::pair<TCPSocket* , DUNE::Utils::LineParser*>> m_clients;
       //! Timer to send data to clients
-      DUNE::Time::Counter<float> m_client_data_timer;
+      DUNE::Time::Counter<double> m_client_data_timer;
       //! Temperature of Comm module
       double m_temperature;
       //! Pressure of Comm module
       double m_pressure;
       //! Relative Humidity inside Comm module
       double m_humidity;
-      //! count to send Channel states
-      uint8_t m_send_channel_state;
+      //! Array of channel info
+      std::vector<channel_info> m_channels;
 
 
       Task(const std::string& name, Tasks::Context& ctx):
@@ -82,6 +92,10 @@ namespace Transports
         param("TCP Data Timer", m_args.tcp_data_timer)
         .defaultValue("5.0")
         .description("Time between async TCP data");
+
+        param("Maximum Clients", m_args.max_clients)
+        .defaultValue("5")
+        .description("Maximum Number of clients allowed to connect at a time");
 
         bind<IMC::Temperature>(this);
         bind<IMC::Pressure>(this);
@@ -130,10 +144,10 @@ namespace Transports
         if (m_sock != NULL)
         {
           m_sock->bind(m_args.tcp_port);
-          m_sock->listen(1024);
+          m_sock->listen(m_args.max_clients);
           m_sock->setNoDelay(true);
           m_poll.add(*m_sock);
-          this->inf("Listening on 0.0.0.0:%d" , m_args.tcp_port);
+          inf("Listening on 0.0.0.0:%d" , m_args.tcp_port);
           m_client_data_timer.setTop(m_args.tcp_data_timer);
         }
       }
@@ -148,12 +162,12 @@ namespace Transports
           delete m_sock;
           m_sock = NULL;
 
-
-          std::list<TCPSocket*>::iterator itr = m_clients.begin();
-          for (; itr != m_clients.end(); ++itr)
+          std::list<std::pair<TCPSocket* , DUNE::Utils::LineParser*>>::iterator iter = m_clients.begin();
+          while (iter != m_clients.end())
           {
-            m_poll.remove(*(*itr));
-            delete *itr;
+            m_poll.remove(*(iter->first));
+            delete iter->first;
+            ++iter;
           }
           m_clients.clear();
         }
@@ -164,11 +178,12 @@ namespace Transports
       {
         if (m_poll.wasTriggered(*m_sock))
         {
-          this->inf(DTR("accepting connection request"));
+          inf(DTR("accepting connection request"));
           try
           {
             TCPSocket* nc = m_sock->accept();
-            m_clients.push_back(nc);
+            DUNE::Utils::LineParser* parser = new DUNE::Utils::LineParser("\r\n");
+            m_clients.push_back(std::make_pair(nc , parser));
             m_poll.add(*nc);
           }
           catch (std::runtime_error& e)
@@ -181,22 +196,21 @@ namespace Transports
       void
       consume(const IMC::TextMessage* msg)
       {
-        char state[200];
-        int len = sprintf(state,"+SMSRECV,%s,%s\r\n" , msg->origin.c_str() , msg->text.c_str() );
-        dispatchToClients(state , len);
+        std::string resp = "+SMSRECV," + msg->origin + "," + msg->text + "\r\n";
+        dispatchToClients(resp);
       }
 
       void
       consume(const IMC::SmsStatus* msg)
       {
-        char state[200];
-        int len;
+        std::stringstream resp;
+        resp  << "+SMSSTATE," << msg->req_id << "," << msg->status;
         if (!msg->info.empty())
-          len = sprintf(state,"+SMSSTATE,%d,%d,%s\r\n" ,msg->req_id , msg->status , msg->info.c_str());
+          resp << "," << msg->info << "\r\n";
         else
-          len = sprintf(state,"+SMSSTATE,%d,%d\r\n" ,msg->req_id , msg->status);
+          resp << "\r\n";
 
-        dispatchToClients(state , len);
+        dispatchToClients(resp.str());
       }
 
       void
@@ -220,70 +234,89 @@ namespace Transports
       void
       consume(const IMC::PowerChannelState* msg)
       {
-        char state[50];
-        if (m_send_channel_state)
+        for (uint8_t i = 0 ; i < m_channels.size() ; i++)
         {
-          int len = sprintf(state,"+PSTATE,%s,%d\r\n" , msg->name.c_str() , msg->state);
-          dispatchToClients(state , len);
-          m_send_channel_state++;
+          if (m_channels[i].name == msg->name)
+          {
+            m_channels[i].state = msg->state;
+            return;
+          }
         }
+        channel_info channel;
+        channel.name = msg->name;
+        channel.state = msg->state;
+        m_channels.push_back(channel);
       }
 
       void
       checkClientSockets(void)
       {
-        char bfr[512];
-        char command_resp[10] = "ERROR\r\n";
-
-        std::list<TCPSocket*>::iterator itr = m_clients.begin();
-        while (itr != m_clients.end())
+        std::list<std::pair<TCPSocket* , DUNE::Utils::LineParser*>>::iterator iter = m_clients.begin();
+        while (iter != m_clients.end())
         {
-          if (m_poll.wasTriggered(*(*itr)))
+          if (m_poll.wasTriggered(*(iter->first)))
           {
             try
             {
-              int rv = (*itr)->read(bfr, sizeof(bfr));
-
-              if (rv > 0 && !strncmp(bfr , "$PCONTROL," , 10))
+              char bfr[512];
+              int rv = (iter->first)->read(bfr, sizeof(bfr));
+              if (rv)
               {
-                std::vector<std::string> parts;
-                String::split(std::string(bfr), ",", parts);
-                if (parts.size() > 2)
+                (iter->second)->append(bfr , rv);
+
+                std::vector<std::string> lines;
+                if ((iter->second)->parse(lines))
                 {
-                  IMC::PowerChannelControl pcc;
-                  pcc.name = parts[1];
-                  pcc.op = std::stoi(parts[2]);
-                  dispatch(pcc);
-                  memset(command_resp , 0 , sizeof(command_resp));
-                  sprintf(command_resp , "OK\r\n");
+                  for (unsigned int i = 0 ; i < lines.size() ; i ++)
+                  {
+                    std::string response = "ERROR\r\n";
+                    if (lines[i].find("$PCONTROL,") != std::string::npos)
+                    {
+                      std::vector<std::string> parts;
+                      String::split(lines[i], ",", parts);
+                      if (parts.size() > 2)
+                      {
+                        //Check If PCC name in vector
+                        for (unsigned int j = 0 ; j < m_channels.size() ; j++ )
+                        {
+                          if (m_channels[j].name == parts[1])
+                          {
+                            IMC::PowerChannelControl pcc;
+                            pcc.name = parts[1];
+                            pcc.op = std::stoi(parts[2]);
+                            dispatch(pcc);
+                            response.clear();
+                            response = "OK\r\n";
+                          }
+                        }
+                      }
+                    }
+                    else if (lines[i].find("$SMSSEND,") != std::string::npos)
+                    {
+                      std::vector<std::string> parts;
+                      String::split(lines[i], ",", parts);
+                      if (parts.size() > 4)
+                      {
+                        IMC::SmsRequest msg;
+                        msg.req_id = std::stoi(parts[1]);
+                        msg.destination = parts[2];
+                        msg.sms_text = parts[3];
+                        msg.timeout = std::stoi(parts[4]);
+                        dispatch(msg);
+                        response.clear();
+                        response = "OK\r\n";
+                      }
+                    }
+                    (iter->first)->writeString(response.c_str());
+                  }
                 }
               }
-              else if (rv > 0  && !strncmp(bfr , "$SMSSEND," , 5))
-              {
-                std::vector<std::string> parts;
-                String::split(std::string(bfr), ",", parts);
-
-                if (parts.size() > 4)
-                {
-                  IMC::SmsRequest msg;
-                  msg.req_id = std::stoi(parts[1]);
-                  msg.destination = parts[2];
-                  msg.sms_text = parts[3];
-                  msg.timeout = std::stoi(parts[4]);
-                  dispatch(msg);
-                  memset(command_resp , 0 , sizeof(command_resp));
-                  sprintf(command_resp , "OK\r\n");
-                }
-              }
-              (*itr)->write(command_resp, (unsigned)strlen(command_resp));
-              //! Return Value Here
             }
             catch (Network::ConnectionClosed& e)
             {
               (void)e;
-              m_poll.remove(*(*itr));
-              delete *itr;
-              itr = m_clients.erase(itr);
+              m_poll.remove((*iter->first));
+              iter = m_clients.erase(iter);
               continue;
             }
             catch (std::runtime_error& e)
@@ -291,29 +324,28 @@ namespace Transports
               err("%s", e.what());
             }
           }
-          ++itr;
+          ++iter;
         }
       }
 
       //! Dispatch data to all TCP clients
       void
-      dispatchToClients(const char* bfr, unsigned bfr_len)
+      dispatchToClients(const std::string str)
       {
-        std::list<TCPSocket*>::iterator itr = m_clients.begin();
-        while (itr != m_clients.end())
+        std::list<std::pair<TCPSocket* , DUNE::Utils::LineParser*>>::iterator iter = m_clients.begin();
+        while (iter != std::end(m_clients))
         {
           try
           {
-            (*itr)->write(bfr, bfr_len);
-            ++itr;
+            (iter->first)->writeString(str.c_str());
           }
           catch (std::runtime_error& e)
           {
             err("%s", e.what());
-            m_poll.remove(*(*itr));
-            delete *itr;
-            itr = m_clients.erase(itr);
+            m_poll.remove(*(iter->first));
+            iter = m_clients.erase(iter);
           }
+          ++iter;
         }
       }
 
@@ -330,17 +362,11 @@ namespace Transports
             checkClientSockets();
           }
 
-          if (m_send_channel_state == 6)
-          {
-            m_send_channel_state = 0;
-          }
-
           if (m_client_data_timer.overflow())
           {
-            char data[100];
-            int len = sprintf(data , "+TPH,%2.2f,%2.2f,%2.2f\r\n",m_temperature , m_pressure , m_humidity);
-            dispatchToClients(data , len);
-            m_send_channel_state = 1;
+            std::stringstream data;
+            data << "+TPH," << std::fixed << std::setprecision(2) << m_temperature << "," << m_pressure << "," << m_humidity << "\r\n";
+            dispatchToClients(data.str());
             m_client_data_timer.reset();
           }
           waitForMessages(0.005);
