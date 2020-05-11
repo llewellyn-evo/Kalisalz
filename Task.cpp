@@ -79,6 +79,12 @@ namespace Transports
       double m_humidity;
       //! Array of channel info
       std::vector<channel_info> m_channels;
+      //! GSM RSSI
+      double m_gsm_rssi;
+      //! GSM Link Latency
+      double m_gsm_latency;
+      //! Com module voltage
+      double m_comm_voltage;
 
 
       Task(const std::string& name, Tasks::Context& ctx):
@@ -103,6 +109,9 @@ namespace Transports
         bind<IMC::PowerChannelState>(this);
         bind<IMC::SmsStatus>(this);
         bind<IMC::TextMessage>(this);
+        bind<IMC::RSSI>(this);
+        bind<IMC::LinkLatency>(this);
+        bind<IMC::Voltage>(this);
       }
 
       //! Update internal state with new parameter values.
@@ -204,7 +213,7 @@ namespace Transports
       consume(const IMC::SmsStatus* msg)
       {
         std::stringstream resp;
-        resp  << "+SMSSTATE," << msg->req_id << "," << msg->status;
+        resp  << "+SMSSTATE," << msg->req_id << "," << (int)msg->status;
         if (!msg->info.empty())
           resp << "," << msg->info << "\r\n";
         else
@@ -246,6 +255,24 @@ namespace Transports
         channel.name = msg->name;
         channel.state = msg->state;
         m_channels.push_back(channel);
+      }
+
+      void
+      consume(const IMC::RSSI* msg)
+      {
+        m_gsm_rssi = msg->value;
+      }
+
+      void
+      consume(const IMC::LinkLatency* msg)
+      {
+        m_gsm_latency = msg->value * 1000;
+      }
+
+      void
+      consume(const IMC::Voltage* msg)
+      {
+        m_comm_voltage = msg->value;
       }
 
       void
@@ -367,6 +394,26 @@ namespace Transports
             std::stringstream data;
             data << "+TPH," << std::fixed << std::setprecision(2) << m_temperature << "," << m_pressure << "," << m_humidity << "\r\n";
             dispatchToClients(data.str());
+
+            data.str("");
+            data << "+GSMRSSI," << std::fixed << std::setprecision(2) << m_gsm_rssi << "\r\n";
+            dispatchToClients(data.str());
+
+            data.str("");
+            data << "+GSMLATENCY," << std::fixed << std::setprecision(2) << m_gsm_latency << "\r\n";
+            dispatchToClients(data.str());
+
+            data.str("");
+            data << "+VOLTAGE," << std::fixed << std::setprecision(2) << m_comm_voltage << "\r\n";
+            dispatchToClients(data.str());
+
+            for (unsigned i = 0; i < m_channels.size() ; i++)
+            {
+              std::stringstream pcs;
+              pcs << "+PSTATE," << m_channels[i].name << "," << m_channels[i].state << "\r\n";
+              dispatchToClients(pcs.str());
+            }
+
             m_client_data_timer.reset();
           }
           waitForMessages(0.005);
