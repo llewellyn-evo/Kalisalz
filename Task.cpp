@@ -46,8 +46,6 @@ namespace Transports
       unsigned tcp_port;
       //! timer for TCP client async data
       double tcp_data_timer;
-      //! maxcimum allowed clients
-      unsigned int max_clients;
     };
 
     struct channel_info
@@ -99,10 +97,6 @@ namespace Transports
         .defaultValue("5.0")
         .description("Time between async TCP data");
 
-        param("Maximum Clients", m_args.max_clients)
-        .defaultValue("5")
-        .description("Maximum Number of clients allowed to connect at a time");
-
         bind<IMC::Temperature>(this);
         bind<IMC::Pressure>(this);
         bind<IMC::RelativeHumidity>(this);
@@ -153,7 +147,7 @@ namespace Transports
         if (m_sock != NULL)
         {
           m_sock->bind(m_args.tcp_port);
-          m_sock->listen(m_args.max_clients);
+          m_sock->listen(1024);
           m_sock->setNoDelay(true);
           m_poll.add(*m_sock);
           inf("Listening on 0.0.0.0:%d" , m_args.tcp_port);
